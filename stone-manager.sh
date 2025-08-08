@@ -69,14 +69,12 @@ pair_trust_connect() {
   log "Pair/Trust/Connect starting for $mac"
   bluetoothctl <<EOF >>"$LOG_FILE" 2>&1
 power on
-agent on
+agent NoInputNoOutput
 default-agent
-scan on
-connect $mac
+pairable on
 trust $mac
 pair $mac
 connect $mac
-scan off
 info $mac
 exit
 EOF
@@ -88,8 +86,10 @@ find_rfcomm_channel() {
   log "Querying SDP for RFCOMM channel on $mac"
   local ch
   ch=$(sdptool browse "$mac" 2>>"$LOG_FILE" | awk '
-    $0 ~ /Service Name: Serial Port/ {in_sp=1}
-    in_sp && $0 ~ /Channel: / {print $2; exit}
+    tolower($0) ~ /protocol descriptor list/ {in_pdl=1}
+    in_pdl && tolower($0) ~ /protocol: rfcomm/ {in_rf=1}
+    in_rf && tolower($0) ~ /channel:/ {print $2; exit}
+    tolower($0) ~ /additional protocol descriptor list/ {in_pdl=0; in_rf=0}
   ')
   if [[ -z "$ch" ]]; then
     log "No RFCOMM channel found via SDP, defaulting to 1"
@@ -100,12 +100,23 @@ find_rfcomm_channel() {
   echo "$ch"
 }
 
+find_rfcomm_channels() {
+  local mac="$1"
+  log "Querying SDP for ALL RFCOMM channels on $mac"
+  sdptool browse "$mac" 2>>"$LOG_FILE" | awk '
+    tolower($0) ~ /protocol descriptor list/ {in_pdl=1}
+    in_pdl && tolower($0) ~ /protocol: rfcomm/ {in_rf=1}
+    in_rf && tolower($0) ~ /channel:/ {print $2}
+    tolower($0) ~ /additional protocol descriptor list/ {in_pdl=0; in_rf=0}
+  ' | awk '!seen[$0]++'
+}
+
 rfcomm_connected() {
-  # Returns 0 if rfcomm0 shows connected
-  if ! sudo_wrap rfcomm show 0 >>"$LOG_FILE" 2>&1; then
-    return 1
+  if sudo_wrap rfcomm show 0 >>"$LOG_FILE" 2>&1 | grep -qi "connected"; then
+    return 0
   fi
-  sudo_wrap rfcomm show 0 2>>"$LOG_FILE" | grep -qi "connected"
+  # Fallback: device present and writable often implies connected
+  [[ -w "$RFCOMM_DEV" ]]
 }
 
 wait_for_connected() {
@@ -123,20 +134,48 @@ wait_for_connected() {
   return 1
 }
 
-connect_rfcomm() {
+connect_rfcomm_try_channel() {
   local mac="$1" channel="$2"
-  log "Connecting RFCOMM to $mac on channel $channel"
-  # Ensure any existing process is stopped and device released
+  log "Trying RFCOMM channel $channel"
   disconnect_rfcomm_quiet
-  # Start a background rfcomm connect process that maintains the link
   sudo_wrap rfcomm connect 0 "$mac" "$channel" >>"$LOG_FILE" 2>&1 &
   echo $! > "$PID_FILE"
-  log "rfcomm connect started with PID $(cat "$PID_FILE")"
-  if wait_for_connected 12; then
+  if wait_for_connected 6; then
+    log "Connected on channel $channel"
     return 0
   else
+    local pid=$(cat "$PID_FILE" 2>/dev/null || true)
+    if [[ -n "$pid" ]] && ps -p "$pid" >/dev/null 2>&1; then
+      sudo_wrap kill "$pid" >>"$LOG_FILE" 2>&1 || true
+      sleep 0.2
+    fi
+    rm -f "$PID_FILE"
+    log "Channel $channel failed"
     return 1
   fi
+}
+
+connect_rfcomm() {
+  local mac="$1"; shift
+  local channels=("$@")
+  if (( ${#channels[@]} == 0 )); then
+    channels=(1 2 3 4 5 6 7 8)
+  fi
+  log "Connecting RFCOMM to $mac, trying channels: ${channels[*]}"
+  local ch
+  for ch in "${channels[@]}"; do
+    if connect_rfcomm_try_channel "$mac" "$ch"; then
+      return 0
+    fi
+  done
+  # As a last resort, brute force a wider range
+  log "Bruteforce channels 1..16"
+  for ch in $(seq 1 16); do
+    if connect_rfcomm_try_channel "$mac" "$ch"; then
+      return 0
+    fi
+  done
+  return 1
 }
 
 disconnect_rfcomm_quiet() {
@@ -173,6 +212,26 @@ EOF
 
 is_connected() {
   rfcomm_connected
+}
+
+is_acl_connected() {
+  local mac="$1"
+  bluetoothctl info "$mac" 2>>"$LOG_FILE" | awk -F': ' '/Connected:/ {print $2}' | grep -qi '^yes$'
+}
+
+wait_for_acl() {
+  local mac="$1" max_wait_s=${2:-10}
+  local waited=0
+  while (( waited < max_wait_s )); do
+    if is_acl_connected "$mac"; then
+      log "ACL connected for $mac"
+      return 0
+    fi
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  log "Timeout waiting for ACL connection to $mac"
+  return 1
 }
 
 # Build a packet as true binary bytes stored in PACKET
@@ -312,16 +371,18 @@ rgb_set_mood() {
 }
 
 connect_flow() {
-  local mac channel
+  local mac channels
   if ! mac=$(pick_device_menu); then return 1; fi
   CURRENT_MAC="$mac"
   pair_trust_connect "$mac" || true
-  channel=$(find_rfcomm_channel "$mac")
-  if connect_rfcomm "$mac" "$channel"; then
+  wait_for_acl "$mac" 12 || log "Proceeding without ACL confirmation"
+  # Prefer all discovered RFCOMM channels
+  mapfile -t channels < <(find_rfcomm_channels "$mac")
+  if connect_rfcomm "$mac" "${channels[@]}"; then
     handshake || true
-    whiptail --msgbox "Connected to $mac on channel $channel" 8 60
+    whiptail --msgbox "Connected to $mac" 8 60
   else
-    whiptail --msgbox "Failed to connect to $mac on channel $channel. See log." 8 60
+    whiptail --msgbox "Failed to connect to $mac. See log." 8 60
   fi
 }
 
@@ -343,6 +404,7 @@ main_menu() {
       mood "Set LED mood/style" \
       rgb_off "Turn OFF LEDs" \
       disconnect "Disconnect RFCOMM" \
+      status "Show connection status" \
       logs "View debug log" \
       quit "Exit" \
       3>&1 1>&2 2>&3) || exit 0
@@ -355,6 +417,11 @@ main_menu() {
       mood) rgb_set_mood ;;
       rgb_off) send_command "$VENDOR_PT" 531 ;;
       disconnect) disconnect_flow ;;
+      status)
+        local acl="no" rf="no"
+        [[ -n "$CURRENT_MAC" ]] && is_acl_connected "$CURRENT_MAC" && acl="yes"
+        rfcomm_connected && rf="yes"
+        whiptail --msgbox "ACL connected: $acl\nRFCOMM connected: $rf\nDevice: ${CURRENT_MAC:-n/a}" 10 50 ;;
       logs) view_logs ;;
       quit) exit 0 ;;
     esac
