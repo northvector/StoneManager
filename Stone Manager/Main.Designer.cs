@@ -1,4 +1,4 @@
-﻿namespace Stone_Manager
+namespace Stone_Manager
 {
     partial class Main
     {
@@ -79,7 +79,7 @@
             this.button_connect.Name = "button_connect";
             this.button_connect.Size = new System.Drawing.Size(262, 34);
             this.button_connect.TabIndex = 0;
-            this.button_connect.Text = "Connect to OpenRGB";
+            this.button_connect.Text = "LED Toggle";
             this.button_connect.UseVisualStyleBackColor = false;
             this.button_connect.Click += new System.EventHandler(this.button1_Click);
             // 

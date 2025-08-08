@@ -23,7 +23,6 @@ namespace Stone_Manager
         bool is_lamp_on = false;
 
         private System.Windows.Forms.Timer _valueChangeTimer;
-        Classes.OpenRGB openRGB = new Classes.OpenRGB();
         public static Main mainform;
         int color_R = 255, color_G = 255, color_B = 255, brightness = 100, mood = 2;
 
@@ -41,12 +40,9 @@ namespace Stone_Manager
    
         private void button1_Click(object sender, EventArgs e)
         {
-            if (OpenRGB_Status && Bluetooth.bluetoothClient.Connected)
-            {
-                openRGB_Sync.Enabled = !OpenRGB_mode;
-                OpenRGB_mode = !OpenRGB_mode;
-                button_connect.Text = $"RGB Sync [{(OpenRGB_mode ? "On" : "OFF")}]";
-            }
+            // Repurpose as LED toggle
+            if (!Bluetooth.IsConnected()) return;
+            Button2_Click(sender, e);
         }
 
         private async void Button2_Click(object sender, EventArgs e)
@@ -78,10 +74,6 @@ namespace Stone_Manager
             try
             {
                 Bluetooth.Connect();
-                if (openRGB.Connect())
-                {
-                    OpenRGB_Status = true;
-                }
             }
             catch (Exception)
             {
@@ -125,20 +117,9 @@ namespace Stone_Manager
 
         }
 
-        private void OpenRGB_Sync_Tick(object sender, EventArgs e)
-        {
-            if (OpenRGB_Status && OpenRGB_mode)
-            {
-                Color rgb = openRGB.GetFirstDeviceColor();
-                int adjustedR = (rgb.R >= 63) ? rgb.R : 63;
-                int adjustedG = (rgb.G >= 63) ? rgb.G : 63;
-                int adjustedB = (rgb.B >= 63) ? rgb.B : 63;
-                if (color_R == adjustedR && color_G == adjustedG && color_B == adjustedB) return;
-                trackBar_R.Value = color_R = adjustedR;
-                trackBar_G.Value = color_G = adjustedG;
-                trackBar_B.Value = color_B = adjustedB;
-            }
-        }
+                 private void OpenRGB_Sync_Tick(object sender, EventArgs e)
+         {
+         }
 
         private void ledstyle_Click(object sender, EventArgs e)
         {
