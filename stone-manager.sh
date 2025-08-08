@@ -12,13 +12,25 @@ LOG_FILE="/tmp/stone-manager.log"
 PID_FILE="/tmp/stone-rfcomm.pid"
 CURRENT_MAC=""
 
+init_log() {
+  # Ensure the log file exists and is world-writable to avoid permission issues when running with/without sudo
+  if [[ -e "$LOG_FILE" ]]; then
+    chmod 666 "$LOG_FILE" 2>/dev/null || sudo chmod 666 "$LOG_FILE" 2>/dev/null || true
+  else
+    (umask 000; : > "$LOG_FILE") 2>/dev/null || sudo sh -c "umask 000; : > '$LOG_FILE'" 2>/dev/null || true
+    chmod 666 "$LOG_FILE" 2>/dev/null || sudo chmod 666 "$LOG_FILE" 2>/dev/null || true
+  fi
+}
+
 log() {
-  # Timestamped log lines
-  printf '[%(%F %T)T] %s\n' -1 "$*" >> "$LOG_FILE"
+  # Timestamped log lines; never fail the script if logging fails
+  local line
+  printf -v line '[%(%F %T)T] %s\n' -1 "$*"
+  { printf "%s" "$line" >> "$LOG_FILE"; } 2>/dev/null || { init_log; printf "%s" "$line" >> "$LOG_FILE" 2>/dev/null || true; }
 }
 
 require_tools() {
-  local tools=(bluetoothctl sdptool rfcomm whiptail dd timeout od)
+  local tools=(bluetoothctl sdptool rfcomm whiptail dd timeout od stty)
   local missing=()
   for t in "${tools[@]}"; do
     command -v "$t" >/dev/null 2>&1 || missing+=("$t")
@@ -81,6 +93,26 @@ EOF
   log "bluetoothctl pairing sequence complete for $mac"
 }
 
+is_acl_connected() {
+  local mac="$1"
+  bluetoothctl info "$mac" 2>>"$LOG_FILE" | awk -F': ' '/Connected:/ {print $2}' | grep -qi '^yes$'
+}
+
+wait_for_acl() {
+  local mac="$1" max_wait_s=${2:-10}
+  local waited=0
+  while (( waited < max_wait_s )); do
+    if is_acl_connected "$mac"; then
+      log "ACL connected for $mac"
+      return 0
+    fi
+    sleep 1
+    waited=$(( waited + 1 ))
+  done
+  log "Timeout waiting for ACL connection to $mac"
+  return 1
+}
+
 find_rfcomm_channel() {
   local mac="$1"
   log "Querying SDP for RFCOMM channel on $mac"
@@ -115,7 +147,6 @@ rfcomm_connected() {
   if sudo_wrap rfcomm show 0 >>"$LOG_FILE" 2>&1 | grep -qi "connected"; then
     return 0
   fi
-  # Fallback: device present and writable often implies connected
   [[ -w "$RFCOMM_DEV" ]]
 }
 
@@ -134,6 +165,13 @@ wait_for_connected() {
   return 1
 }
 
+configure_tty() {
+  if [[ -e "$RFCOMM_DEV" ]]; then
+    sudo_wrap stty -F "$RFCOMM_DEV" -echo -icanon -opost -isig -icrnl -ocrnl cs8 -cstopb -parenb 115200 2>>"$LOG_FILE" || true
+    log "Configured TTY $RFCOMM_DEV to raw mode"
+  fi
+}
+
 connect_rfcomm_try_channel() {
   local mac="$1" channel="$2"
   log "Trying RFCOMM channel $channel"
@@ -141,6 +179,7 @@ connect_rfcomm_try_channel() {
   sudo_wrap rfcomm connect 0 "$mac" "$channel" >>"$LOG_FILE" 2>&1 &
   echo $! > "$PID_FILE"
   if wait_for_connected 6; then
+    configure_tty
     log "Connected on channel $channel"
     return 0
   else
@@ -168,7 +207,6 @@ connect_rfcomm() {
       return 0
     fi
   done
-  # As a last resort, brute force a wider range
   log "Bruteforce channels 1..16"
   for ch in $(seq 1 16); do
     if connect_rfcomm_try_channel "$mac" "$ch"; then
@@ -179,7 +217,6 @@ connect_rfcomm() {
 }
 
 disconnect_rfcomm_quiet() {
-  # Kill background rfcomm connect process if present
   if [[ -f "$PID_FILE" ]]; then
     local pid
     pid=$(cat "$PID_FILE" || true)
@@ -190,7 +227,6 @@ disconnect_rfcomm_quiet() {
     fi
     rm -f "$PID_FILE"
   fi
-  # Release rfcomm device
   if [[ -e "$RFCOMM_DEV" ]]; then
     log "Releasing $RFCOMM_DEV"
     sudo_wrap rfcomm release 0 >>"$LOG_FILE" 2>&1 || sudo_wrap rfcomm release "$RFCOMM_DEV" >>"$LOG_FILE" 2>&1 || true
@@ -212,26 +248,6 @@ EOF
 
 is_connected() {
   rfcomm_connected
-}
-
-is_acl_connected() {
-  local mac="$1"
-  bluetoothctl info "$mac" 2>>"$LOG_FILE" | awk -F': ' '/Connected:/ {print $2}' | grep -qi '^yes$'
-}
-
-wait_for_acl() {
-  local mac="$1" max_wait_s=${2:-10}
-  local waited=0
-  while (( waited < max_wait_s )); do
-    if is_acl_connected "$mac"; then
-      log "ACL connected for $mac"
-      return 0
-    fi
-    sleep 1
-    waited=$(( waited + 1 ))
-  done
-  log "Timeout waiting for ACL connection to $mac"
-  return 1
 }
 
 ## Build a packet into a temp file to avoid NUL-in-variable issues
@@ -263,7 +279,6 @@ make_packet_file() {
 
   PACKET_FILE=$(mktemp)
   {
-    # Print backslash-octal escapes for bytes
     printf '\\%03o' 255 1 "$flags" "$payload_len" "$vendor_hi" "$vendor_lo" "$cmd_hi" "$cmd_lo"
     local b
     for b in "${payload[@]}"; do
@@ -285,7 +300,7 @@ send_packet() {
   fi
   local file="$1"
   log "TX $(hex_dump_bytes "$file")"
-  if ! sudo timeout 3s dd if="$file" of="$RFCOMM_DEV" bs=1 status=none conv=fsync >>"$LOG_FILE" 2>&1; then
+  if ! sudo timeout 1s dd if="$file" of="$RFCOMM_DEV" bs=1 status=none oflag=sync >>"$LOG_FILE" 2>&1; then
     log "dd write timed out or failed"
     whiptail --title "Write failed" --msgbox "Failed to write to RFCOMM device (timeout)." 8 60
     return 1
@@ -371,7 +386,6 @@ connect_flow() {
   CURRENT_MAC="$mac"
   pair_trust_connect "$mac" || true
   wait_for_acl "$mac" 12 || log "Proceeding without ACL confirmation"
-  # Prefer all discovered RFCOMM channels
   mapfile -t channels < <(find_rfcomm_channels "$mac")
   if connect_rfcomm "$mac" "${channels[@]}"; then
     handshake || true
@@ -382,12 +396,14 @@ connect_flow() {
 }
 
 view_logs() {
-  touch "$LOG_FILE"
+  init_log
   whiptail --title "Debug Log" --scrolltext --textbox "$LOG_FILE" 22 88
 }
 
 main_menu() {
-  : > "$LOG_FILE"   # clear log at start
+  init_log
+  : > "$LOG_FILE" 2>/dev/null || sudo sh -c ": > '$LOG_FILE'" 2>/dev/null || true
+  chmod 666 "$LOG_FILE" 2>/dev/null || sudo chmod 666 "$LOG_FILE" 2>/dev/null || true
   log "STONE Manager started"
   while true; do
     local choice
