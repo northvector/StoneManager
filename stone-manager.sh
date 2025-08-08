@@ -101,9 +101,8 @@ is_connected() {
   [[ -e "$RFCOMM_DEV" ]]
 }
 
-# Build a packet string with backslash-escaped hex for printf
+# Build a packet as true binary bytes stored in PACKET
 # Args: vendor_id(int, decimal or 0x hex), command_id(int), payload bytes (0-255, decimal)
-# Output: variable PACKET set to the printf-ready string
 build_packet() {
   local vendor_id="$1" command_id="$2"; shift 2
   local payload=("$@")
@@ -128,13 +127,19 @@ build_packet() {
   local cmd_hi=$(( (command >> 8) & 0xFF ))
   local cmd_lo=$(( command & 0xFF ))
 
-  PACKET=$(printf "\\x%02X\\x%02X\\x%02X\\x%02X\\x%02X\\x%02X\\x%02X\\x%02X" 0xFF 0x01 "$flags" "$payload_len" "$vendor_hi" "$vendor_lo" "$cmd_hi" "$cmd_lo")
-
+  # Compose list of all bytes
+  local -a nums=(255 1 "$flags" "$payload_len" "$vendor_hi" "$vendor_lo" "$cmd_hi" "$cmd_lo")
   local b
   for b in "${payload[@]}"; do
-    b=$(( b & 0xFF ))
-    PACKET+=$(printf "\\x%02X" "$b")
+    nums+=( $(( b & 0xFF )) )
   done
+
+  # Convert to octal escapes and then to binary in PACKET
+  local esc=""
+  for b in "${nums[@]}"; do
+    printf -v esc '%s\%03o' "$esc" "$b"
+  done
+  printf -v PACKET '%b' "$esc"
 }
 
 send_packet() {
@@ -143,8 +148,8 @@ send_packet() {
     return 1
   fi
   local pkt="$1"
-  # shellcheck disable=SC2059
-  printf "$pkt" | sudo_wrap tee "$RFCOMM_DEV" >/dev/null
+  # Write raw binary to device
+  printf "%s" "$pkt" | sudo_wrap tee "$RFCOMM_DEV" >/dev/null
 }
 
 send_command() {
