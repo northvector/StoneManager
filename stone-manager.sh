@@ -1,25 +1,31 @@
 #!/usr/bin/env bash
-set -euo pipefail
+set -uo pipefail
 
 # STONE Manager - Raspberry Pi OS shell UI
-# Uses RFCOMM SPP, replicating the exact packet format from the Windows app:
+# Exact packet format:
 # [0xFF, 0x01, flags(0), payloadLen, vendorHi, vendorLo, commandHi, commandLo, payload..., (no checksum since flags=0)]
-
-# Dependencies required: bluetoothctl, sdptool, rfcomm, whiptail
 
 RFCOMM_DEV="/dev/rfcomm0"
 DEVICE_NAME_DEFAULT="STONE"
 VENDOR_PT=0x5054
+LOG_FILE="/tmp/stone-manager.log"
+PID_FILE="/tmp/stone-rfcomm.pid"
+CURRENT_MAC=""
+
+log() {
+  # Timestamped log lines
+  printf '[%(%F %T)T] %s\n' -1 "$*" >> "$LOG_FILE"
+}
 
 require_tools() {
-  local tools=(bluetoothctl sdptool rfcomm whiptail)
+  local tools=(bluetoothctl sdptool rfcomm whiptail dd timeout od)
   local missing=()
   for t in "${tools[@]}"; do
     command -v "$t" >/dev/null 2>&1 || missing+=("$t")
   done
   if (( ${#missing[@]} > 0 )); then
     echo "Missing tools: ${missing[*]}" >&2
-    echo "Install BlueZ and whiptail. On Raspberry Pi OS: sudo apt-get update && sudo apt-get install -y bluez whiptail" >&2
+    echo "Install BlueZ and whiptail. On Raspberry Pi OS: sudo apt-get update && sudo apt-get install -y bluez whiptail coreutils" >&2
     exit 1
   fi
 }
@@ -37,15 +43,11 @@ pick_device_menu() {
   mapfile -t devices < <(bluetoothctl devices | awk '{print $2"\t"substr($0, index($0,$3))}')
 
   local choices=()
-  local preselect=""
   for line in "${devices[@]}"; do
     local mac name
     mac="${line%%$'\t'*}"
     name="${line#*$'\t'}"
     choices+=("$mac" "$name")
-    if [[ "$name" == "$DEVICE_NAME_DEFAULT" ]]; then
-      preselect="$mac"
-    fi
   done
 
   local title="Select Bluetooth Device"
@@ -64,8 +66,8 @@ pick_device_menu() {
 
 pair_trust_connect() {
   local mac="$1"
-  # Pair, trust, and connect using bluetoothctl in a single non-interactive session
-  bluetoothctl <<EOF | sed -n 's/^\[CHG\] Device .* Connected: \(yes\|no\)$/Connected: \1/p'
+  log "Pair/Trust/Connect starting for $mac"
+  bluetoothctl <<EOF >>"$LOG_FILE" 2>&1
 power on
 agent on
 default-agent
@@ -75,30 +77,102 @@ trust $mac
 pair $mac
 connect $mac
 scan off
+info $mac
 exit
 EOF
+  log "bluetoothctl pairing sequence complete for $mac"
 }
 
 find_rfcomm_channel() {
   local mac="$1"
-  # Try to find the RFCOMM channel for Serial Port service via SDP
-  sdptool browse "$mac" | awk '
-    $0 ~ /Service Name: Serial Port/ {in_sp=1} 
+  log "Querying SDP for RFCOMM channel on $mac"
+  local ch
+  ch=$(sdptool browse "$mac" 2>>"$LOG_FILE" | awk '
+    $0 ~ /Service Name: Serial Port/ {in_sp=1}
     in_sp && $0 ~ /Channel: / {print $2; exit}
-  '
+  ')
+  if [[ -z "$ch" ]]; then
+    log "No RFCOMM channel found via SDP, defaulting to 1"
+    ch=1
+  else
+    log "Found RFCOMM channel: $ch"
+  fi
+  echo "$ch"
 }
 
-bind_rfcomm() {
-  local mac="$1" channel="$2"
-  # Release any existing binding
-  if [[ -e "$RFCOMM_DEV" ]]; then
-    sudo_wrap rfcomm release "$RFCOMM_DEV" || true
+rfcomm_connected() {
+  # Returns 0 if rfcomm0 shows connected
+  if ! sudo_wrap rfcomm show 0 >>"$LOG_FILE" 2>&1; then
+    return 1
   fi
-  sudo_wrap rfcomm bind 0 "$mac" "$channel"
+  sudo_wrap rfcomm show 0 2>>"$LOG_FILE" | grep -qi "connected"
+}
+
+wait_for_connected() {
+  local max_wait_s=${1:-10}
+  local waited=0
+  while (( waited < max_wait_s )); do
+    if rfcomm_connected; then
+      log "rfcomm reports connected"
+      return 0
+    fi
+    sleep 0.5
+    waited=$(( waited + 1 ))
+  done
+  log "Timeout waiting for RFCOMM to connect"
+  return 1
+}
+
+connect_rfcomm() {
+  local mac="$1" channel="$2"
+  log "Connecting RFCOMM to $mac on channel $channel"
+  # Ensure any existing process is stopped and device released
+  disconnect_rfcomm_quiet
+  # Start a background rfcomm connect process that maintains the link
+  sudo_wrap rfcomm connect 0 "$mac" "$channel" >>"$LOG_FILE" 2>&1 &
+  echo $! > "$PID_FILE"
+  log "rfcomm connect started with PID $(cat "$PID_FILE")"
+  if wait_for_connected 12; then
+    return 0
+  else
+    return 1
+  fi
+}
+
+disconnect_rfcomm_quiet() {
+  # Kill background rfcomm connect process if present
+  if [[ -f "$PID_FILE" ]]; then
+    local pid
+    pid=$(cat "$PID_FILE" || true)
+    if [[ -n "$pid" ]] && ps -p "$pid" >/dev/null 2>&1; then
+      log "Killing rfcomm PID $pid"
+      sudo_wrap kill "$pid" >>"$LOG_FILE" 2>&1 || true
+      sleep 0.2
+    fi
+    rm -f "$PID_FILE"
+  fi
+  # Release rfcomm device
+  if [[ -e "$RFCOMM_DEV" ]]; then
+    log "Releasing $RFCOMM_DEV"
+    sudo_wrap rfcomm release 0 >>"$LOG_FILE" 2>&1 || sudo_wrap rfcomm release "$RFCOMM_DEV" >>"$LOG_FILE" 2>&1 || true
+  fi
+}
+
+disconnect_flow() {
+  log "User requested disconnect"
+  disconnect_rfcomm_quiet
+  if [[ -n "$CURRENT_MAC" ]]; then
+    log "bluetoothctl disconnect $CURRENT_MAC"
+    bluetoothctl <<EOF >>"$LOG_FILE" 2>&1
+disconnect $CURRENT_MAC
+exit
+EOF
+  fi
+  whiptail --msgbox "Disconnected." 8 40
 }
 
 is_connected() {
-  [[ -e "$RFCOMM_DEV" ]]
+  rfcomm_connected
 }
 
 # Build a packet as true binary bytes stored in PACKET
@@ -117,7 +191,7 @@ build_packet() {
 
   local payload_len=${#payload[@]}
   if (( payload_len > 254 )); then
-    echo "Payload too long ($payload_len)" >&2
+    log "Payload too long: $payload_len"
     return 1
   fi
 
@@ -127,14 +201,12 @@ build_packet() {
   local cmd_hi=$(( (command >> 8) & 0xFF ))
   local cmd_lo=$(( command & 0xFF ))
 
-  # Compose list of all bytes
   local -a nums=(255 1 "$flags" "$payload_len" "$vendor_hi" "$vendor_lo" "$cmd_hi" "$cmd_lo")
   local b
   for b in "${payload[@]}"; do
     nums+=( $(( b & 0xFF )) )
   done
 
-  # Convert to octal escapes and then to binary in PACKET
   local esc=""
   for b in "${nums[@]}"; do
     printf -v esc '%s\%03o' "$esc" "$b"
@@ -142,24 +214,41 @@ build_packet() {
   printf -v PACKET '%b' "$esc"
 }
 
+hex_dump_bytes() {
+  local file="$1"
+  od -An -t x1 -v "$file" | tr -s ' ' ' ' | sed 's/^ *//; s/ *$//'
+}
+
 send_packet() {
   if ! is_connected; then
+    log "send_packet: not connected"
     whiptail --title "Not connected" --msgbox "RFCOMM is not connected." 8 50
     return 1
   fi
   local pkt="$1"
-  # Write raw binary to device
-  printf "%s" "$pkt" | sudo_wrap tee "$RFCOMM_DEV" >/dev/null
+  local tmp
+  tmp=$(mktemp)
+  printf "%s" "$pkt" > "$tmp"
+  log "TX $(hex_dump_bytes "$tmp")"
+  if ! timeout 3s sudo_wrap dd if="$tmp" of="$RFCOMM_DEV" bs=1 status=none conv=fsync >>"$LOG_FILE" 2>&1; then
+    log "dd write timed out or failed"
+    rm -f "$tmp"
+    whiptail --title "Write failed" --msgbox "Failed to write to RFCOMM device (timeout)." 8 60
+    return 1
+  fi
+  rm -f "$tmp"
+  return 0
 }
 
 send_command() {
   local vendor_id="$1" command_id="$2"; shift 2
+  log "send_command vendor=$vendor_id cmd=$command_id payload=(${*:-})"
   build_packet "$vendor_id" "$command_id" "$@" || return 1
   send_packet "$PACKET"
 }
 
 handshake() {
-  # Send initial commands like Windows app: 1, 16, and 578 with random 1..2
+  log "Performing handshake"
   send_command "$VENDOR_PT" 1 || return 1
   send_command "$VENDOR_PT" 16 || return 1
   local r=$(( (RANDOM % 2) + 1 ))
@@ -222,37 +311,31 @@ rgb_set_mood() {
   send_command "$VENDOR_PT" 530 "$br" "$mood" "$r" "$g" "$b"
 }
 
-rgb_off() {
-  send_command "$VENDOR_PT" 531
-}
-
 connect_flow() {
   local mac channel
   if ! mac=$(pick_device_menu); then return 1; fi
-  pair_trust_connect "$mac" >/dev/null || true
+  CURRENT_MAC="$mac"
+  pair_trust_connect "$mac" || true
   channel=$(find_rfcomm_channel "$mac")
-  if [[ -z "$channel" ]]; then
-    # Fallback to channel 1 if SDP did not return one
-    channel=1
-  fi
-  if bind_rfcomm "$mac" "$channel"; then
+  if connect_rfcomm "$mac" "$channel"; then
     handshake || true
     whiptail --msgbox "Connected to $mac on channel $channel" 8 60
   else
-    whiptail --msgbox "Failed to connect/bind RFCOMM." 8 50
+    whiptail --msgbox "Failed to connect to $mac on channel $channel. See log." 8 60
   fi
 }
 
-disconnect_flow() {
-  if [[ -e "$RFCOMM_DEV" ]]; then
-    sudo_wrap rfcomm release "$RFCOMM_DEV" || true
-  fi
+view_logs() {
+  touch "$LOG_FILE"
+  whiptail --title "Debug Log" --scrolltext --textbox "$LOG_FILE" 22 88
 }
 
 main_menu() {
+  : > "$LOG_FILE"   # clear log at start
+  log "STONE Manager started"
   while true; do
     local choice
-    choice=$(whiptail --title "STONE Manager (Pi)" --menu "Choose an action" 20 70 10 \
+    choice=$(whiptail --title "STONE Manager (Pi)" --menu "Choose an action" 20 72 10 \
       connect "Connect to device" \
       volume "Set volume (0-31)" \
       rgb_on "Turn ON LEDs (set color+brightness)" \
@@ -260,6 +343,7 @@ main_menu() {
       mood "Set LED mood/style" \
       rgb_off "Turn OFF LEDs" \
       disconnect "Disconnect RFCOMM" \
+      logs "View debug log" \
       quit "Exit" \
       3>&1 1>&2 2>&3) || exit 0
 
@@ -269,8 +353,9 @@ main_menu() {
       rgb_on) rgb_turn_on ;;
       rgb_set) rgb_set_color ;;
       mood) rgb_set_mood ;;
-      rgb_off) rgb_off ;;
+      rgb_off) send_command "$VENDOR_PT" 531 ;;
       disconnect) disconnect_flow ;;
+      logs) view_logs ;;
       quit) exit 0 ;;
     esac
   done
