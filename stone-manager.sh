@@ -234,9 +234,10 @@ wait_for_acl() {
   return 1
 }
 
-# Build a packet as true binary bytes stored in PACKET
+## Build a packet into a temp file to avoid NUL-in-variable issues
+# Sets PACKET_FILE to the path of the temp file
 # Args: vendor_id(int, decimal or 0x hex), command_id(int), payload bytes (0-255, decimal)
-build_packet() {
+make_packet_file() {
   local vendor_id="$1" command_id="$2"; shift 2
   local payload=("$@")
 
@@ -260,17 +261,15 @@ build_packet() {
   local cmd_hi=$(( (command >> 8) & 0xFF ))
   local cmd_lo=$(( command & 0xFF ))
 
-  local -a nums=(255 1 "$flags" "$payload_len" "$vendor_hi" "$vendor_lo" "$cmd_hi" "$cmd_lo")
-  local b
-  for b in "${payload[@]}"; do
-    nums+=( $(( b & 0xFF )) )
-  done
-
-  local esc=""
-  for b in "${nums[@]}"; do
-    printf -v esc '%s\%03o' "$esc" "$b"
-  done
-  printf -v PACKET '%b' "$esc"
+  PACKET_FILE=$(mktemp)
+  {
+    # Print backslash-octal escapes for bytes
+    printf '\\%03o' 255 1 "$flags" "$payload_len" "$vendor_hi" "$vendor_lo" "$cmd_hi" "$cmd_lo"
+    local b
+    for b in "${payload[@]}"; do
+      printf '\\%03o' $(( b & 0xFF ))
+    done
+  } | printf '%b' > "$PACKET_FILE"
 }
 
 hex_dump_bytes() {
@@ -284,26 +283,22 @@ send_packet() {
     whiptail --title "Not connected" --msgbox "RFCOMM is not connected." 8 50
     return 1
   fi
-  local pkt="$1"
-  local tmp
-  tmp=$(mktemp)
-  printf "%s" "$pkt" > "$tmp"
-  log "TX $(hex_dump_bytes "$tmp")"
-  if ! timeout 3s sudo_wrap dd if="$tmp" of="$RFCOMM_DEV" bs=1 status=none conv=fsync >>"$LOG_FILE" 2>&1; then
+  local file="$1"
+  log "TX $(hex_dump_bytes "$file")"
+  if ! sudo timeout 3s dd if="$file" of="$RFCOMM_DEV" bs=1 status=none conv=fsync >>"$LOG_FILE" 2>&1; then
     log "dd write timed out or failed"
-    rm -f "$tmp"
     whiptail --title "Write failed" --msgbox "Failed to write to RFCOMM device (timeout)." 8 60
     return 1
   fi
-  rm -f "$tmp"
   return 0
 }
 
 send_command() {
   local vendor_id="$1" command_id="$2"; shift 2
   log "send_command vendor=$vendor_id cmd=$command_id payload=(${*:-})"
-  build_packet "$vendor_id" "$command_id" "$@" || return 1
-  send_packet "$PACKET"
+  make_packet_file "$vendor_id" "$command_id" "$@" || return 1
+  send_packet "$PACKET_FILE"
+  rm -f "$PACKET_FILE" 2>/dev/null || true
 }
 
 handshake() {
